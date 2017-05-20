@@ -1,3 +1,8 @@
+## Project specific
+schedule_*
+.idea
+.DS_Store
+
 *.pyc
 *DS
 ### Python template
