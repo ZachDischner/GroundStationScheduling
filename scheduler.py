@@ -50,7 +50,7 @@ import pandas as pd
 import random
 import plotly.plotly as py
 import plotly
-import plotly.figure_factory as ff
+from plotly.tools import FigureFactory as ff
 import coloredlogs
 from collections import defaultdict
 from dateutil.relativedelta import relativedelta
@@ -638,86 +638,14 @@ def plot_schedule(schedule_df):
 
     return url
 
-def random_color():
-    levels = range(32,256,32)
-    random.seed(66)
-    return tuple(random.choice(levels) for _ in range(3))
-
-colors = {sat: f"rgb{random_color()}" for sat in DF["satellite"].unique() }
-
-
-def access_to_block(access):
-    taskClass = "Access"
-
-    GANTTBlock = TimelineClasses.TimelineBlock(color=None,label=None,starting_time=None,ending_time=None,info=None,theID=None)
-
-    ###### Explicitly set specifics.
-
-    ## Color
-    GANTTBlock.setColor(colors[access["satellite"]])
-
-    ## Label
-    # GANTTBlock.setLabel("%s Task (%s)" % (taskClass, self["PHASE"]))
-    GANTTBlock.setLabel("%s" % access["id"])
-
-    ## Times
-    GANTTBlock.setStartingTime(access["start_time"])
-    GANTTBlock.setEndingTime(access["end_time"])
-
-    ## Info
-    # Just print out the dicionary keys, values in a nicely formatted separated manner
-    sep = max([len(k) for k in access.keys()])
-    # infoString = "\\".join([("(%s)%s %s" % (k," "*(sep-len(k)),v)) for k,v in access.iteritems() if k != "CORE"])
-
-    GANTTBlock.setInfo("TASK!!!:%s" % "foo")
-    GANTTBlock.setID(access["id"])
-
-    # GANTTBlock.setTASKID(access["TASK_ID"])
-    # GANTTBlock.setTASKCLASS(access["TaskClass"])
-    # GANTTBlock.setPHASE(access["PHASE"])
-    return GANTTBlock
-
-def plot_schedule_2(df):
-
-
-    ## -- Make Timeline -- ##
-    rows = []
-    for ant, ant_df in df.groupby("antenna"):
-        blocks = []
-        for index,row in ant_df.iterrows():
-            block = TimelineClasses.TimelineBlock()
-            block.setLabel("%s" % row["antenna"])
-            # block.setBlockLabel(row["satellite"])
-            block.setStartingTime(row["start_time"])
-            block.setEndingTime(row["end_time"])
-            blocks.append(block)
-            blockString = block.generate()
-        row = TimelineClasses.TimelineRow(label=ant, blocks=blocks)
-        rows.append(row)
-
-    var = TimelineClasses.TimelineVar(rows=rows)
-    
-    ## set the variable name
-    var.setVarName("foo") 
-
-    ## Create the Timeline Page
-    logger.debug("creating timeline html")
-    timeline = TimelineClasses.Timeline()
-    timeline.setTimelineVar(var)
-    timeline.setTitle("GANTT")
-    timeline_html = timeline.generate()
-    timeline_page = TimelineClasses.TimelinePage(timelines=timeline)
-    timeline_page_html = timeline_page.generate( fname="test.html")
-    # with open("test.html", "w") as f:
-    #     f.write(timeline_html)
-
-    return timeline_html
-
 ##############################################################################
 #                              Runtime Execution
 #----------*----------*----------*----------*----------*----------*----------*
 if __name__=="__main__":
-    pass
+    print("Demo")
+    g = SchedulerGraph()
+    _ = g.optimize_multipass()
+    sys.exit(0)
 
 
 

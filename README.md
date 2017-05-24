@@ -22,7 +22,7 @@ Anaconda's Python distribution is recommended for getting started. Easiest way t
 from the included `environment.yml` file. http://conda.pydata.org/docs/using/envs.html.
 
 ```
-conda env create -f environment.yml
+conda env create -f environment.yaml
 source activate schedulerpy 
 ```
 
@@ -32,7 +32,7 @@ Consult `environment.yml` for a list of all modules and install however you're m
 ### Clone
 
 ```
-git clone git@github.com:ZachDischner/groundstationscheduler.py
+git clone git@github.com:ZachDischner/GroundStationScheduling.py
 ```
 
 ### Run

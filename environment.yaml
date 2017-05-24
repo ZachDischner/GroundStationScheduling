@@ -3,5 +3,6 @@ dependencies:
   - python=3.6
   - pandas
   - plotly
+  - jupyter
   - pip:
     - coloredlogs
