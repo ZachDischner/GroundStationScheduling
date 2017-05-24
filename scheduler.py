@@ -15,7 +15,8 @@ Created:  Jan/13/2016
 Modified: Jan/13/2016
 
 Prototype ground station scheduling library, specifically for coding challenge
-put on by Planet Labs. See prompt.md for details. 
+put on by Planet Labs. See prompt.md for details. Should be considered a good 
+first order scheduling approximation
 
 Accesses should be stored as a csv file or equivalent, with the following properties per access
 
@@ -31,8 +32,9 @@ Improvements:
     * Precompute all exclusions - AKA a dictionary with {access_id: [list of access_ids to exclude]}
         * Bet this would speed up the SchedulerGraph.generate_possibilities() substantially
         * Also would build framework for Integer Optimization below
+    * Use Google's GANTT chart library for visualization https://developers.google.com/chart/interactive/docs/gallery/ganttchart
     * Formulate as an Integer Optmization Problem https://developers.google.com/optimization/mip/integer_opt
-
+    * Better Schedule Deconflicter
 Examples:
 
 """
@@ -46,14 +48,13 @@ import json
 import logging
 import pandas as pd
 import random
-import arrow                        # Awesome time library
 import plotly.plotly as py
 import plotly
 import plotly.figure_factory as ff
 import coloredlogs
 from collections import defaultdict
 from dateutil.relativedelta import relativedelta
-from typing import Generator
+from typing import Generator, Callable
 
 ## For convenience, use my credential set. IRL a company one would be used
 plotly.tools.set_credentials_file(username='dischnerz', api_key='6TkYcsdEPZEH93e6RYU2')
@@ -76,7 +77,7 @@ _here = os.path.dirname(os.path.realpath(__file__))
 _ACCESS_FILE = os.path.join(_here, "sample_ground_accesses.csv")
 _WEIGHTS = {"utility": 1,
             "lost_imagery": -2,
-            "eclipse_time":5,
+            "eclipse_time":5,  # Not used, but included in case you wanted to use tiem in eclipse vs lost imagery as a metric
             "elevation":100}
 _MIN_ANT_TRANSITION_TIME = 1 # minute
 _MIN_SAT_CONTACTS = 3
@@ -86,18 +87,16 @@ DF = pd.DataFrame()
 #                                   Classes
 #----------*----------*----------*----------*----------*----------*----------*
 class Access(dict):
-    def __init__(self,access:dict, df=None):
+    def __init__(self,access:dict):
         ## Different input types:
         if isinstance(access, pd.DataFrame):
             access = access.iloc[0]
         self.update(access)
         self._score = None
-        if df is None:
-            df = DF
-        self.df = df
+
 
     @property
-    def score(self):
+    def base_score(self):
         if self._score is None:
             self._score = compute_base_score(self)
         return self._score
@@ -106,12 +105,12 @@ class Access(dict):
         try:
             return f"Access: ({self['id']}) {self['satellite']} <--> {self['antenna']}" + \
                     f"({self['utility']:3.3f} MB), " + \
-                    f"{arrow.get(self['start_time']).format('YYYY-MM-DD HH:mm:ss')} - {arrow.get(self['end_time']).format('YYYY-MM-DD HH:mm:ss')}, " + \
-                    f"(score: {self.score:3.3f})"
+                    f"{self['start_time'].to_pydatetime()} - {self['end_time'].to_pydatetime()}, " + \
+                    f"(unadjusted score: {self.base_score:3.3f} )"
         except:
             return "Access dictionary with unparseable parameters"
     
-    def get_children(self, search_limit:int=2):
+    def get_children(self, source_df:pd.DataFrame, search_limit:int=2):
         start_min_cutoff = self['end_time'] + relativedelta(minutes=5)
         start_max_cutoff = self['end_time'] + relativedelta(hours=search_limit)
         antenna_available = self['end_time'] + relativedelta(minutes=_MIN_ANT_TRANSITION_TIME)
@@ -125,18 +124,42 @@ class Access(dict):
                         or 
                         (antenna == '{self['antenna']}' and start_time >= '{antenna_available}') 
                     )""".replace("\n"," ").replace("    ","")
-        yield from ((Access(a)) for _, a in self.df.query(query).sort_values(by=['start_time','score'],ascending=False)[0:10].iterrows()) # Add a minute
+        yield from ((Access(a)) for _, a in source_df.query(query).sort_values(by=['start_time','score'],ascending=False)[0:10].iterrows()) # Add a minute
 
 
 class SchedulerGraph(object):
     def __repr__(self):
         return f"Graph with root at: {self.root['id']}. Best schedule from here: <{self.best_paths[0]}>"
 
-    def __init__(self, source_file:str=_ACCESS_FILE, root_id:int=None, root_loc:int=None, weights:dict=_WEIGHTS):
+    def __init__(self, source_file:str=_ACCESS_FILE, root_id:int=None, root_loc:int=None, weights:dict=_WEIGHTS, score_func:Callable=None):
+        """Instantiate a SchedulerGraph object, which can build and analze a schedule possibilities graph in order to create a good schedule
+
+        Kwargs:
+            source_file:    CSV to find master schedule of access opportunities from
+            root_id:        Optionally, specify the first access from which to build the graph by unique Access ID
+            root_loc:       Optionally, specify the row of the access from which to build the graph
+                    If neither are provided, one will be determined automatically
+            weights:        Dictionary of weights to assign to various properties of the access. See _WEIGHTS for a template
+            score_func:     Function that takes an access (key-value pairs described by a row in the `source_file`) and returns
+                            a numeric score for a given access
+        """
         self.df_master = load_accesses(source_file)
-        self.weights = defaultdict(lambda:1.0)
+        self.weights = defaultdict(lambda:0)
         self.weights.update(weights)
 
+        ## Adjustable priority maps per satellite and antenna
+        self.ant_priority = defaultdict(lambda: 1.0)  # Default priority maps have no effect
+        self.sat_priority = defaultdict(lambda: 1.0)
+
+        ## Provided or default function for scoring an access, including adjusting multiplicatives for ant/sat prioritization
+        if score_func is None:
+            score_func = compute_base_score
+        self.scorer = lambda access: score_func(access, weights=self.weights)*self.ant_priority[access["antenna"]]*self.sat_priority[access["satellite"]]
+
+        ## Immediately rescore our accesses based on provided weights and whatnot
+        self.rescore()
+
+        ## Determine the root (starting place for the graph)
         self.root = None
         if root_id is not None:
             try:
@@ -151,7 +174,9 @@ class SchedulerGraph(object):
                 else:
                     logger.warn(f"Provided starting row ({root_loc}) does not exist in the access database ({source_file}). Trying to automatically determine starting Access")
 
+        self.autoroot = False
         if self.root is None:
+            self.autoroot = True
             self.pick_root()
 
         logger.info(f"Creating new SchedulerGraph() with starting access (root): {self.root}")
@@ -159,20 +184,25 @@ class SchedulerGraph(object):
         ## Containers for the "optimal" schedule, as determined later
         self.optimal_schedule = None
 
-        ## Adjustable priority maps per satellite and antenna
-        self.ant_priority = defaultdict(lambda: 1.0)  # Default priority maps have no effect
-        self.sat_priority = defaultdict(lambda: 1.0)
-
         ## Some tracking variables for different graph searching algorithems
         self.paths = {}
-        self.best_paths = [(compute_base_score(self.root, self.weights), (self.root["id"]))]
+        self.best_paths = [(self.scorer(self.root), (self.root["id"]))]
         self.nodes = []
         self.cache = {}
 
+    def rescore(self):
+        """Update 'score' column in the master 'database' of Accesses.
+        """
+        self.df_master["score"] = self.df_master.apply(lambda row: self.scorer(row), axis=1)
+
     def pick_root(self):
         """Pick the best root to start this graph from (best first Access to build the schedule upon)
+
+        Best root is just the highest scoring access that occurs within the first two hours
         """
-        self.root = Access(self.df_master.iloc[0])
+        query = f"start_time < '{self.df_master['start_time'].min() + relativedelta(hours=2)}'"
+        self.root = Access(self.df_master.query(query).sort_values(by="score", ascending=False).iloc[0])
+        return self.root
 
     def filter_accesses(self, ids:list)->pd.DataFrame:
         """Filter master schedule by a list of Access ids 
@@ -227,7 +257,7 @@ class SchedulerGraph(object):
             conflicts[ant] = check_for_overlap(df_ant, info="antenna")
         return sat_usage, sat_utility, ant_usage, conflicts
 
-    def generate_possibilities(self,path:list, hours_to_search:int=2, max_possibilities:int=10)-> Generator[Access, None, None]:
+    def generate_possibilities(self,path:list, hours_to_search:int=2, max_possibilities:int=10, min_hours_between_passes:int=4)-> Generator[Access, None, None]:
         """
 
         Kinda tricksy. Based on the `path` of Accesses already in the schedule, generates a 
@@ -259,7 +289,7 @@ class SchedulerGraph(object):
                 last_pass_end = schedule_sofar[schedule_sofar["satellite"] == sat]["end_time"].max()
             else:
                 last_pass_end = schedule_sofar["start_time"].min()
-            satellite_avoid.append(f"(satellite=='{sat}' and start_time <= '{last_pass_end}') ")
+            satellite_avoid.append(f"(satellite=='{sat}' and start_time <= '{last_pass_end + relativedelta(hours=min_hours_between_passes)}') ")
 
         antenna_avoid = []
         for ant in self.df_master["antenna"].unique():
@@ -275,10 +305,8 @@ class SchedulerGraph(object):
         conflict_query = " and ".join(satellite_avoid) + " and " + " and ".join(antenna_avoid)
         avoid_df = self.df_master.query(conflict_query)
         possible_df = self.df_master[~self.df_master["id"].isin(avoid_df["id"])].query(query)
-        # return query
         yield from ((Access(a)) for _, a in possible_df.sort_values(by=['start_time'], ascending=True)[0:max_possibilities].iterrows()) # Add a minute
 
-        # yield from ((Access(a)) for _, a in self.df_master[~self.df_master["id"].isin(self.df_master.query(query)["id"])].sort_values(by=['start_time','score'], ascending=True)[0:max_possibilities].iterrows()) # Add a minute
 
     def dfs_path(self, node=None, path=None, pathscore=0, store_all_paths=False, depth=0):
         """Depth-First-Search of access graph posibilities, where final score is calculated 
@@ -303,7 +331,7 @@ class SchedulerGraph(object):
 
         newpath = path + tuple([node['id']])
         # Score of the path traversed from TOP down to (and including) this point, including adjustments
-        pathscore += compute_base_score(node, self.weights) * self.sat_priority[node["satellite"]]  * self.ant_priority[node["antenna"]] 
+        pathscore += self.scorer(node)
 
         print("\rPath-Down DFS searching " + "."*depth, end="")
         if depth > 5:
@@ -328,11 +356,18 @@ class SchedulerGraph(object):
             print()
 
     def dfs_cached(self, node:Access=None, path:tuple=None, depth:int=0) -> (int,tuple):
-        """
+        """Perform a depth-first-search of the graph, caching the best downward route as you go
+
+        Recursive function. Children at each node are generated based on the path traversed 
+        down to the current `node`. Each child is explored, and the best total score of the
+        path traversed down from here (`node`->child->child...) is stored in the cache for 
+        faster lookups next time around
+
+        + This makes exploring a huge graph WAY faster. 
+        - Caching best downward path means that the overall path chosen probably isn't perfect
 
         Todo: 
-            * Refactor the "best_down_score" - Score the path as a whole and not just
-                the treat as the sum of node scores. AKA factor in resource usage constraints
+
         """
         ## Initial conditions
         if path is None:
@@ -356,10 +391,10 @@ class SchedulerGraph(object):
         if possibilities:
             ## Maybe filter out conflicted possibilities below?
             best_down_score, best_down_path = sorted(possibilities, key=lambda p:p[0], reverse=True)[0]
-            best_score = (compute_base_score(node, self.weights) * self.sat_priority[node["satellite"]]  * self.ant_priority[node["antenna"]]) + best_down_score  
+            best_score = self.scorer(node) + best_down_score  
             best_path = tuple([node["id"]]) + best_down_path
         else:
-            best_score, best_path = node.score, tuple([node["id"]])
+            best_score, best_path = self.scorer(node), tuple([node["id"]])
 
         if best_score>self.best_paths[0][0]:
             self.best_paths.insert(0,(best_score,best_path))
@@ -369,7 +404,7 @@ class SchedulerGraph(object):
             print()
         return best_score, best_path # Tuple of (score, (pathlist))
 
-    def optmimize_multipass(self, num_passes:int=3, ant_adj_rate:float=1.05, sat_adj_rate:float=1.25, publish:bool=False) -> (list,list,list):
+    def optimize_multipass(self, num_passes:int=3, ant_adj_rate:float=1.05, sat_adj_rate:float=1.25, publish:bool=False, deconflict:bool=False) -> (list,list,list):
         """Perform multiple passes of cached DFS scheduling search
 
         In between each run, self-adjust (har har har) the adjustment maps to try and boost
@@ -404,30 +439,76 @@ class SchedulerGraph(object):
             ## Adjust adjustment maps
             for sat in sat_usage:
                 if sat_usage[sat] < _MIN_SAT_CONTACTS:
-                    logger.info(f"Satellite {sat} did not get enough passes ({sat_usage[sat]}). Applying higher weight for future runs")
+                    logger.info(f"Satellite {sat} did not get enough passes ({sat_usage[sat]}). Applying higher weight for future runs: {self.sat_priority[sat]} -> {self.sat_priority[sat] * sat_adj_rate}")
                     self.sat_priority[sat] *= sat_adj_rate
 
             for ant in ant_usage:
                 if ant_usage[ant] > _MAX_ANT_CONTACTS:
-                    logger.info(f"Antenna {ant} had too many passes ({ant_usage[ant]}). Applying lower weight for future runs")
-                    self.ant_priority[ant] /= ant_adj_rate
+                    logger.info(f"Antenna {ant} had too many passes ({ant_usage[ant]}). Applying lower weight for future runs: {self.ant_priority[ant]} -> {self.ant_priority[ant]/(ant_adj_rate*ant_usage[ant]//6)}")
+                    self.ant_priority[ant] /= (ant_adj_rate*ant_usage[ant]//6)
+                ## If we're not using any contacts, bump that one espeecially
+                if ant_usage[ant] < 3:
+                    logger.info(f"Antenna {ant} just ({ant_usage[ant]}). Applying higher weight for future runs: {self.ant_priority[ant]} -> {self.ant_priority[ant]*ant_adj_rate}")
+                    self.ant_priority[ant] *= ant_adj_rate
+
+            ## Rescore accesses based on these new updates
+            self.rescore()
 
             scores.append(score)
             paths.append(path)
             stats.append(tuple([sat_usage, sat_utility, ant_usage, conflicts]))
 
+            ## Pick a new root if allowed
+            if self.autoroot:
+                self.pick_root()
+
+            self.optimal_schedule = paths[-1]
+
+        if deconflict:
+            self.optimal_schedule = self.deconflict(self.optimal_schedule)
+
         if publish:
             logger.info("Publishing last run and writing sumamry reports")
-            self.publish(paths[-1])
+            self.publish_sched()
         return scores, paths, stats
+
+    def deconflict(self, ids:list) -> list:
+        """Deconflict a schedule by dropping lowest scoring acceptable overages when a conflict arises
+        """
+        idset = set(ids)
+        ###### 1. Drop accesses when too many bookings on an antenna
+        sched_df = self.filter_accesses(idset).copy()
+        for ant, df in sched_df.groupby("antenna"):
+            if len(df) > _MAX_ANT_CONTACTS:
+                logger.warn(f"Antenna {ant} has {len(df)-_MAX_ANT_CONTACTS} too many contacts! Dropping unnecessary contacts")
+                sat_priority = sched_df["satellite"].value_counts()
+                for sat, num_passes in sat_priority.iteritems():
+                    if num_passes > _MIN_SAT_CONTACTS:
+                        can_drop = df.query(f"satellite == '{sat}'")[0:min([len(df) - _MAX_ANT_CONTACTS, num_passes-_MIN_SAT_CONTACTS]):]
+                        if len(can_drop) > 1:
+                            logger.debug(f"Dropping {len(can_drop)} accesses for satellite {sat} for antenna {ant}")
+                            idset = idset - set(can_drop["id"].values)
+                            return self.deconflict(idset)
+                        else:
+                            continue
+        return idset
+
+
 
     def publish_sched(self,ids:list=None) -> (str,str):
         """Publish schedule as a CSV, include summary statistic report
 
         Creates a directory to store files in with the timestamp
         """
+        if ids is None:
+            if self.optimal_schedule is None:
+                logger.warn("Must provide an interable set of Access IDs, or run `SchedulerGraph.optmimize_multipass()` in order to publish anything")
+                return
+            ids = self.optimal_schedule
+
+        logger.info(f"Publishing {len(ids)} Accesses as a new schedule, with associated reports included")
         df_sched = self.filter_accesses(ids).copy().reset_index(drop='index')
-        df_sched["score"] = df_sched.apply(lambda row: compute_base_score(row, weights=self.weights), axis=1)
+        df_sched["score"] = df_sched.apply(lambda row: self.scorer(row), axis=1)
         sched_score = df_sched["score"].sum()
 
         dirname = f"schedule_span{df_sched['start_time'].min().strftime('%Y%m%d')}-{df_sched['start_time'].max().strftime('%Y%m%d')}"
@@ -435,13 +516,14 @@ class SchedulerGraph(object):
             os.mkdir(dirname)
 
         ## Make a CSV file of the schedule itself
-        df_sched.to_csv(os.path.join(dirname,f"access_schedule-{pd.datetime.now().strftime('%Y%m%d-%H%M')}_score-{sched_score:.0f}.csv"), index=False)
+        csv_file = os.path.join(dirname,f"access_schedule-{pd.datetime.now().strftime('%Y%m%d-%H%M')}_score-{sched_score:.0f}.csv")
+        df_sched.to_csv(csv_file, index=False)
 
         ## Write out summary statistics to a json file
         sat_usage, sat_utility, ant_usage, conflicts = self.validate_schedule(ids)
         sat_utility["total"] = sum(list(sat_utility.values()))
-
-        with open(os.path.join(dirname,f"ScheduleReport-{pd.datetime.now().strftime('%Y%m%d-%H%M')}_score-{sched_score:.0f}.json"), "w") as report:
+        report_file = os.path.join(dirname,f"ScheduleReport-{pd.datetime.now().strftime('%Y%m%d-%H%M')}_score-{sched_score:.0f}.json")
+        with open(report_file, "w") as report:
             json.dump({"SatelliteUsage":sat_usage, 
                         "SatelliteUtility":sat_utility, 
                         "AntennaUsage":ant_usage, 
@@ -450,11 +532,15 @@ class SchedulerGraph(object):
 
         ## Create a static web page that redirects you to an online GANTT chart
         plotly_url = plot_schedule(df_sched)
-        with open(os.path.join(dirname, f"SchedulePlot_{pd.datetime.now().strftime('%Y%m%d-%H%M')}_score-{sched_score:.0f}.html"), "w") as plotpage:
-            plotpage.write(f'<meta http-equiv="refresh" content="0; url={plotly_url.resource}" />')
-
-        logger.info(f"Published schedule and associated reports/plots are now available in {dirname}")
-
+        if plotly_url:
+            with open(os.path.join(dirname, f"SchedulePlot_{pd.datetime.now().strftime('%Y%m%d-%H%M')}_score-{sched_score:.0f}.html"), "w") as plotpage:
+                plotpage.write(f'<meta http-equiv="refresh" content="0; url={plotly_url.resource}" />')
+            logger.info(f"Published schedule and associated reports/plots are now available in {dirname}")
+        else:
+            logger.info("No GANTT chart created, Try `SchedulerGraph().publish_sched()` again when you have an internet connection")
+        
+        logger.info(f"New schedule saved to {csv_file}, report statistics saved to: {report_file}")
+        return csv_file, report_file
 
         
 
@@ -463,14 +549,19 @@ class SchedulerGraph(object):
 #----------*----------*----------*----------*----------*----------*----------*
 def compute_base_score(access:dict, weights:dict=_WEIGHTS):
     """Compute base score of an access according to weight dictionary
+
+    Default module level _WEIGHTS dictionary will be used, but you can provide
+    your own with whichever parameters you would like (smart defaultdict()) will
+    not make use of any weight variables that aren't included)
     """
     # Add error checking, etc
     _weights = defaultdict(lambda:0.0)
     _weights.update(weights)
     return weights["utility"]*access["utility"] + \
             weights["lost_imagery"]*access["lost_imagery"] + \
-            weights["eclipse_time"]*access["time_in_eclipse"] + \
             weights["elevation"]*pd.np.sin(access["max_el"]*pd.np.pi/180)
+            # weights["eclipse_time"]*access["time_in_eclipse"] + \   # Other possible factor, included as example
+
 
 def load_accesses(fname:str=_ACCESS_FILE) -> pd.DataFrame:
     """Loads accesses stored as a CSV into a dataframe
@@ -538,11 +629,89 @@ def plot_schedule(schedule_df):
     for _,access in schedule_df.iterrows():
         tmp.append({"Task":access["antenna"].replace("ground_site","ant-"), "Start":access["start_time"], "Finish":access["end_time"], "Resource":access["satellite"]})
     colors = {sat: f"rgb{random_color()}" for sat in schedule_df["satellite"].unique() }
-    fig = ff.create_gantt(tmp, colors=colors, index_col='Resource', show_colorbar=True, group_tasks=True)
-    url=py.iplot(fig, filename='Schedule', world_readable=True)
+    try:
+        fig = ff.create_gantt(tmp, colors=colors, index_col='Resource', show_colorbar=True, group_tasks=True)
+        url = py.iplot(fig, filename='Schedule', world_readable=True)
+    except:
+        logger.warning("Plotly services could not be reached, cannot create GANTT chart visual. Try logging again later")
+        url = None 
+
     return url
 
+def random_color():
+    levels = range(32,256,32)
+    random.seed(66)
+    return tuple(random.choice(levels) for _ in range(3))
 
+colors = {sat: f"rgb{random_color()}" for sat in DF["satellite"].unique() }
+
+
+def access_to_block(access):
+    taskClass = "Access"
+
+    GANTTBlock = TimelineClasses.TimelineBlock(color=None,label=None,starting_time=None,ending_time=None,info=None,theID=None)
+
+    ###### Explicitly set specifics.
+
+    ## Color
+    GANTTBlock.setColor(colors[access["satellite"]])
+
+    ## Label
+    # GANTTBlock.setLabel("%s Task (%s)" % (taskClass, self["PHASE"]))
+    GANTTBlock.setLabel("%s" % access["id"])
+
+    ## Times
+    GANTTBlock.setStartingTime(access["start_time"])
+    GANTTBlock.setEndingTime(access["end_time"])
+
+    ## Info
+    # Just print out the dicionary keys, values in a nicely formatted separated manner
+    sep = max([len(k) for k in access.keys()])
+    # infoString = "\\".join([("(%s)%s %s" % (k," "*(sep-len(k)),v)) for k,v in access.iteritems() if k != "CORE"])
+
+    GANTTBlock.setInfo("TASK!!!:%s" % "foo")
+    GANTTBlock.setID(access["id"])
+
+    # GANTTBlock.setTASKID(access["TASK_ID"])
+    # GANTTBlock.setTASKCLASS(access["TaskClass"])
+    # GANTTBlock.setPHASE(access["PHASE"])
+    return GANTTBlock
+
+def plot_schedule_2(df):
+
+
+    ## -- Make Timeline -- ##
+    rows = []
+    for ant, ant_df in df.groupby("antenna"):
+        blocks = []
+        for index,row in ant_df.iterrows():
+            block = TimelineClasses.TimelineBlock()
+            block.setLabel("%s" % row["antenna"])
+            # block.setBlockLabel(row["satellite"])
+            block.setStartingTime(row["start_time"])
+            block.setEndingTime(row["end_time"])
+            blocks.append(block)
+            blockString = block.generate()
+        row = TimelineClasses.TimelineRow(label=ant, blocks=blocks)
+        rows.append(row)
+
+    var = TimelineClasses.TimelineVar(rows=rows)
+    
+    ## set the variable name
+    var.setVarName("foo") 
+
+    ## Create the Timeline Page
+    logger.debug("creating timeline html")
+    timeline = TimelineClasses.Timeline()
+    timeline.setTimelineVar(var)
+    timeline.setTitle("GANTT")
+    timeline_html = timeline.generate()
+    timeline_page = TimelineClasses.TimelinePage(timelines=timeline)
+    timeline_page_html = timeline_page.generate( fname="test.html")
+    # with open("test.html", "w") as f:
+    #     f.write(timeline_html)
+
+    return timeline_html
 
 ##############################################################################
 #                              Runtime Execution
